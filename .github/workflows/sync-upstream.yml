@@ -1,84 +1,68 @@
-name: Upstream Sync
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "20 19 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: write
   actions: write
-  issues: write
-
-on:
-  schedule:
-    - cron: "0 0 * * *" # every day
-  workflow_dispatch:
-    inputs:
-      confirm_breaking_update:
-        description: "I have reviewed any compatibility update notice and agree to apply it if present / 我已阅读可能存在的兼容性更新公告，并同意在有此类更新时应用"
-        required: true
-        default: false
-        type: boolean
 
 concurrency:
-  group: upstream-sync-${{ github.repository }}
+  group: sync-upstream-main
   cancel-in-progress: false
 
 jobs:
-  sync_latest_from_upstream:
-    name: Sync latest commits from upstream repo
+  sync:
+    name: Sync MarSeventh/CloudFlare-ImgBed
     runs-on: ubuntu-latest
-    if: ${{ github.event.repository.fork }}
+    if: ${{ github.repository == 'nextwa/CloudFlare-ImgBed' }}
 
     steps:
-      - name: Checkout target repo
-        uses: actions/checkout@v6
+      - name: Checkout fork
+        uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
 
-      - name: Check breaking update policy
-        id: breaking_guard
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          UPSTREAM_REPO: MarSeventh/CloudFlare-ImgBed
-          UPSTREAM_BRANCH: main
-          ALLOW_BREAKING_UPDATE: ${{ github.event_name == 'workflow_dispatch' && inputs.confirm_breaking_update == true }}
-        run: bash .github/scripts/breaking-update-guard.sh check
-
-      - name: Sync upstream changes
+      - name: Mirror upstream main and preserve this workflow
         id: sync
-        if: steps.breaking_guard.outputs.blocked != 'true'
-        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
-        with:
-          upstream_sync_repo: MarSeventh/CloudFlare-ImgBed
-          upstream_sync_branch: main
-          target_sync_branch: main
-          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
-          test_mode: false
-
-      - name: Complete breaking update notices
-        if: steps.sync.outcome == 'success'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: bash .github/scripts/breaking-update-guard.sh complete
-
-      - name: Trigger Worker deploy
-        if: steps.sync.outcome == 'success'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run deploy-worker.yml --repo "${{ github.repository }}" --ref main
-
-      - name: Sync failure guidance
-        if: failure() && steps.sync.outcome == 'failure'
         run: |
-          {
-            echo "## ⚠️ 上游同步未完成 / Upstream synchronization did not complete"
-            echo
-            echo "上游同步步骤未能完成。若上游近期修改了 workflow 文件，GitHub 可能会暂停包含 workflow 变更的自动同步；也可能是当前 Fork 的 Actions 权限或同步权限发生了变化。"
-            echo
-            echo "The upstream synchronization step could not be completed. If the upstream workflow files changed recently, GitHub may pause automatic synchronization that includes workflow changes. The issue may also be related to Actions or synchronization permissions in this fork."
-            echo
-            echo "建议先在 GitHub 页面手动执行一次 **Sync fork**，确认 Actions 具有读写权限后，再重新运行本工作流。"
-            echo
-            echo "Please manually use **Sync fork** on GitHub, confirm that Actions has read and write permissions, and then rerun this workflow."
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "[Error] 上游同步未能完成。若上游近期修改了 workflow 文件，请先在 GitHub 页面手动执行一次 Sync Fork，然后重新运行本工作流。"
-          echo "[Error] The upstream sync could not be completed. If the upstream workflow files changed recently, manually run Sync Fork on GitHub and then rerun this workflow."
-          exit 1
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/MarSeventh/CloudFlare-ImgBed.git
+          git fetch upstream main
+
+          current_origin="$(git rev-parse HEAD)"
+          cp .github/workflows/sync-upstream.yml /tmp/sync-upstream.yml
+
+          # Upstream occasionally rewrites main. Resetting to its tree avoids
+          # recurring merge conflicts while retaining this repository's sync job.
+          git reset --hard upstream/main
+          mkdir -p .github/workflows
+          cp /tmp/sync-upstream.yml .github/workflows/sync-upstream.yml
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "Fork is already up to date with upstream/main."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git commit -m "chore: sync MarSeventh/CloudFlare-ImgBed@$(git rev-parse --short upstream/main)"
+          git push --force-with-lease="refs/heads/main:${current_origin}" origin HEAD:main
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger Worker deploy workflow when configured
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh workflow view deploy-worker.yml --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh workflow run deploy-worker.yml --repo "${{ github.repository }}" --ref main
+          fi
